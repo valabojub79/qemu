@@ -62,6 +62,10 @@
 #include "hw/core/sysbus-fdt.h"
 #include "hw/core/platform-bus.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
+#include "hw/ssi/ssi.h"
+#include "system/blockdev.h"
+#include "system/block-backend.h"
 #include "hw/arm/fdt.h"
 #include "hw/intc/arm_gic.h"
 #include "hw/intc/arm_gicv3_common.h"
@@ -210,6 +214,8 @@ static const MemMapEntry base_memmap[] = {
     [VIRT_PVTIME] =             { 0x090a0000, 0x00010000 },
     [VIRT_SECURE_GPIO] =        { 0x090b0000, 0x00001000 },
     [VIRT_ACPI_PCIHP] =         { 0x090c0000, ACPI_PCIHP_SIZE },
+    [VIRT_SPI] =                { 0x090d0000, 0x00001000 },
+    [VIRT_SPI_GPIO] =           { 0x090e0000, 0x00001000 },
     [VIRT_MMIO] =               { 0x0a000000, 0x00000200 },
     /* ...repeating for a total of NUM_VIRTIO_TRANSPORTS, each of that size */
     [VIRT_PLATFORM_BUS] =       { 0x0c000000, 0x02000000 },
@@ -267,6 +273,8 @@ static const int a15irqmap[] = {
     [VIRT_UART1] = 8,
     [VIRT_ACPI_GED] = 9,
     [VIRT_GWDT_WS0] = 10,
+    [VIRT_SPI] = 11,
+    [VIRT_SPI_GPIO] = 12,
     [VIRT_MMIO] = 16, /* ...to 16 + NUM_VIRTIO_TRANSPORTS - 1 */
     [VIRT_GIC_V2M] = 48, /* ...to 48 + NUM_GICV2M_SPIS - 1 */
     [VIRT_SMMU] = 74,    /* ...to 74 + NUM_SMMU_IRQS - 1 */
@@ -1716,6 +1724,117 @@ static void create_gpio_devices(const VirtMachineState *vms, int gpio,
     } else {
         create_secure_gpio_pwr(ms->fdt, pl061_dev, phandle);
     }
+}
+
+/* PL061 line driving the SPI flash CS# */
+#define VIRT_SPI_GPIO_CS    0
+
+/*
+ * Optional PL022 SPI controller with a JESD260 RPMC capable SPI NOR flash.
+ * PL022 has no chip select output, so CS# is driven by a dedicated PL061.
+ * The flash contents come from "-drive if=mtd,index=0" and the RPMC
+ * non-volatile state (root keys, counters) from "-drive if=mtd,index=1".
+ */
+static void create_spi(VirtMachineState *vms, MemoryRegion *mem, bool secure)
+{
+    hwaddr base = vms->memmap[VIRT_SPI].base;
+    hwaddr size = vms->memmap[VIRT_SPI].size;
+    hwaddr gpio_base = vms->memmap[VIRT_SPI_GPIO].base;
+    hwaddr gpio_size = vms->memmap[VIRT_SPI_GPIO].size;
+    int irq = vms->irqmap[VIRT_SPI];
+    int gpio_irq = vms->irqmap[VIRT_SPI_GPIO];
+    const char gpio_compat[] = "arm,pl061\0arm,primecell";
+    const char spi_compat[] = "arm,pl022\0arm,primecell";
+    const char spi_clocknames[] = "sspclk\0apb_pclk";
+    MachineState *ms = MACHINE(vms);
+    DeviceState *pl022, *pl061, *flash;
+    DriveInfo *dinfo;
+    SysBusDevice *s;
+    SSIBus *bus;
+    uint32_t gpio_phandle;
+    char *gpio_node, *spi_node, *flash_node;
+
+    pl061 = qdev_new("pl061");
+    /* CS# is pulled up, i.e. deasserted, until the guest drives it */
+    qdev_prop_set_uint32(pl061, "pullups", BIT(VIRT_SPI_GPIO_CS));
+    qdev_prop_set_uint32(pl061, "pulldowns", 0xff & ~BIT(VIRT_SPI_GPIO_CS));
+    s = SYS_BUS_DEVICE(pl061);
+    sysbus_realize_and_unref(s, &error_fatal);
+    memory_region_add_subregion(mem, gpio_base, sysbus_mmio_get_region(s, 0));
+    sysbus_connect_irq(s, 0, qdev_get_gpio_in(vms->gic, gpio_irq));
+
+    pl022 = qdev_new("pl022");
+    s = SYS_BUS_DEVICE(pl022);
+    sysbus_realize_and_unref(s, &error_fatal);
+    memory_region_add_subregion(mem, base, sysbus_mmio_get_region(s, 0));
+    sysbus_connect_irq(s, 0, qdev_get_gpio_in(vms->gic, irq));
+    bus = (SSIBus *)qdev_get_child_bus(pl022, "ssi");
+
+    flash = qdev_new("w25r256jv");
+    dinfo = drive_get(IF_MTD, 0, 0);
+    if (dinfo) {
+        qdev_prop_set_drive_err(flash, "drive", blk_by_legacy_dinfo(dinfo),
+                                &error_fatal);
+    }
+    dinfo = drive_get(IF_MTD, 0, 1);
+    if (dinfo) {
+        qdev_prop_set_drive_err(flash, "rpmc-drive",
+                                blk_by_legacy_dinfo(dinfo), &error_fatal);
+    }
+    ssi_realize_and_unref(flash, bus, &error_fatal);
+    qdev_connect_gpio_out(pl061, VIRT_SPI_GPIO_CS,
+                          qdev_get_gpio_in_named(flash, SSI_GPIO_CS, 0));
+
+    gpio_phandle = qemu_fdt_alloc_phandle(ms->fdt);
+    gpio_node = g_strdup_printf("/pl061@%" PRIx64, gpio_base);
+    qemu_fdt_add_subnode(ms->fdt, gpio_node);
+    qemu_fdt_setprop_sized_cells(ms->fdt, gpio_node, "reg",
+                                 2, gpio_base, 2, gpio_size);
+    qemu_fdt_setprop(ms->fdt, gpio_node, "compatible",
+                     gpio_compat, sizeof(gpio_compat));
+    qemu_fdt_setprop_cell(ms->fdt, gpio_node, "#gpio-cells", 2);
+    qemu_fdt_setprop(ms->fdt, gpio_node, "gpio-controller", NULL, 0);
+    qemu_fdt_setprop_cells(ms->fdt, gpio_node, "interrupts",
+                           GIC_FDT_IRQ_TYPE_SPI, gpio_irq,
+                           GIC_FDT_IRQ_FLAGS_LEVEL_HI);
+    qemu_fdt_setprop_cell(ms->fdt, gpio_node, "clocks", vms->clock_phandle);
+    qemu_fdt_setprop_string(ms->fdt, gpio_node, "clock-names", "apb_pclk");
+    qemu_fdt_setprop_cell(ms->fdt, gpio_node, "phandle", gpio_phandle);
+
+    spi_node = g_strdup_printf("/spi@%" PRIx64, base);
+    qemu_fdt_add_subnode(ms->fdt, spi_node);
+    qemu_fdt_setprop_sized_cells(ms->fdt, spi_node, "reg", 2, base, 2, size);
+    qemu_fdt_setprop(ms->fdt, spi_node, "compatible",
+                     spi_compat, sizeof(spi_compat));
+    qemu_fdt_setprop_cells(ms->fdt, spi_node, "interrupts",
+                           GIC_FDT_IRQ_TYPE_SPI, irq,
+                           GIC_FDT_IRQ_FLAGS_LEVEL_HI);
+    qemu_fdt_setprop_cells(ms->fdt, spi_node, "clocks",
+                           vms->clock_phandle, vms->clock_phandle);
+    qemu_fdt_setprop(ms->fdt, spi_node, "clock-names",
+                     spi_clocknames, sizeof(spi_clocknames));
+    qemu_fdt_setprop_cell(ms->fdt, spi_node, "#address-cells", 1);
+    qemu_fdt_setprop_cell(ms->fdt, spi_node, "#size-cells", 0);
+    /* GPIO_ACTIVE_LOW */
+    qemu_fdt_setprop_cells(ms->fdt, spi_node, "cs-gpios",
+                           gpio_phandle, VIRT_SPI_GPIO_CS, 1);
+
+    flash_node = g_strdup_printf("%s/flash@0", spi_node);
+    qemu_fdt_add_subnode(ms->fdt, flash_node);
+    qemu_fdt_setprop_string(ms->fdt, flash_node, "compatible", "jedec,spi-nor");
+    qemu_fdt_setprop_cell(ms->fdt, flash_node, "reg", 0);
+    qemu_fdt_setprop_cell(ms->fdt, flash_node, "spi-max-frequency", 12000000);
+
+    if (secure) {
+        qemu_fdt_setprop_string(ms->fdt, gpio_node, "status", "disabled");
+        qemu_fdt_setprop_string(ms->fdt, gpio_node, "secure-status", "okay");
+        qemu_fdt_setprop_string(ms->fdt, spi_node, "status", "disabled");
+        qemu_fdt_setprop_string(ms->fdt, spi_node, "secure-status", "okay");
+    }
+
+    g_free(flash_node);
+    g_free(spi_node);
+    g_free(gpio_node);
 }
 
 static void create_virtio_devices(const VirtMachineState *vms)
@@ -3235,6 +3354,16 @@ static void machvirt_init(MachineState *machine)
         create_gpio_devices(vms, VIRT_SECURE_GPIO, secure_sysmem);
     }
 
+    if (vms->spi == VIRT_SPI_SECURE) {
+        if (!vms->secure) {
+            error_report("mach-virt: spi=secure requires secure=on");
+            exit(1);
+        }
+        create_spi(vms, secure_sysmem, true);
+    } else if (vms->spi == VIRT_SPI_NONSECURE) {
+        create_spi(vms, sysmem, false);
+    }
+
      /* connect powerdown request */
      vms->powerdown_notifier.notify = virt_powerdown_req;
      qemu_register_powerdown_notifier(&vms->powerdown_notifier);
@@ -3689,6 +3818,38 @@ static void virt_set_iommu(Object *obj, const char *value, Error **errp)
     } else {
         error_setg(errp, "Invalid iommu value");
         error_append_hint(errp, "Valid values are none, smmuv3.\n");
+    }
+}
+
+static char *virt_get_spi(Object *obj, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+
+    switch (vms->spi) {
+    case VIRT_SPI_OFF:
+        return g_strdup("off");
+    case VIRT_SPI_SECURE:
+        return g_strdup("secure");
+    case VIRT_SPI_NONSECURE:
+        return g_strdup("nonsecure");
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static void virt_set_spi(Object *obj, const char *value, Error **errp)
+{
+    VirtMachineState *vms = VIRT_MACHINE(obj);
+
+    if (!strcmp(value, "off")) {
+        vms->spi = VIRT_SPI_OFF;
+    } else if (!strcmp(value, "secure")) {
+        vms->spi = VIRT_SPI_SECURE;
+    } else if (!strcmp(value, "nonsecure")) {
+        vms->spi = VIRT_SPI_NONSECURE;
+    } else {
+        error_setg(errp, "Invalid spi value");
+        error_append_hint(errp, "Valid values are off, secure, nonsecure.\n");
     }
 }
 
@@ -4298,6 +4459,13 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
                                           "Set the IOMMU type. "
                                           "Valid values are none and smmuv3");
 
+    object_class_property_add_str(oc, "spi", virt_get_spi, virt_set_spi);
+    object_class_property_set_description(oc, "spi",
+                                          "Add a PL022 SPI controller with an "
+                                          "RPMC capable SPI NOR flash. "
+                                          "Valid values are off, secure "
+                                          "and nonsecure");
+
     object_class_property_add_bool(oc, "default-bus-bypass-iommu",
                                    virt_get_default_bus_bypass_iommu,
                                    virt_set_default_bus_bypass_iommu);
@@ -4391,6 +4559,7 @@ static void virt_instance_init(Object *obj)
 
     /* Default disallows iommu instantiation */
     vms->iommu = VIRT_IOMMU_NONE;
+    vms->spi = VIRT_SPI_OFF;
 
     /* The default root bus is attached to iommu by default */
     vms->default_bus_bypass_iommu = false;

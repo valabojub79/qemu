@@ -100,6 +100,8 @@ enum {
     VIRT_GWDT_WS0,
     VIRT_GWDT_REFRESH,
     VIRT_GWDT_CONTROL,
+    VIRT_SPI,
+    VIRT_SPI_GPIO,
     VIRT_LOWMEMMAP_LAST,
 };
 
@@ -116,6 +118,12 @@ typedef enum VirtIOMMUType {
     VIRT_IOMMU_SMMUV3,
     VIRT_IOMMU_VIRTIO,
 } VirtIOMMUType;
+
+typedef enum VirtSPIMode {
+    VIRT_SPI_OFF,
+    VIRT_SPI_SECURE,
+    VIRT_SPI_NONSECURE,
+} VirtSPIMode;
 
 typedef enum VirtMSIControllerType {
     VIRT_MSI_CTRL_NONE,
@@ -181,6 +189,7 @@ struct VirtMachineState {
     OnOffAuto acpi;
     VirtGICType gic_version;
     VirtIOMMUType iommu;
+    VirtSPIMode spi;
     bool default_bus_bypass_iommu;
     VirtMSIControllerType msi_controller;
     uint16_t virtio_iommu_bdf;
