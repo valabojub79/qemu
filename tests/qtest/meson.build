@@ -297,6 +297,7 @@ qtests_aarch64 = \
    ['iommu-smmuv3-test'] : []) + \
   (config_all_devices.has_key('CONFIG_WDT_SBSA') ? ['sbsa-gwdt-test'] : []) + \
   qtests_cxl +                                                                                  \
+  (config_all_devices.has_key('CONFIG_ARM_VIRT') ? ['m25p80-rpmc-test'] : []) + \
   ['arm-cpu-features',
    'numa-test',
    'boot-serial-test',
@@ -438,6 +439,7 @@ qtests = {
   'erst-test': files('erst-test.c'),
   'ivshmem-test': [rt, '../../contrib/ivshmem-server/ivshmem-server.c'],
   'migration-test': test_migration_files + migration_tls_files + migration_colo_files,
+  'm25p80-rpmc-test': [crypto],
   'pxe-test': files('boot-sector.c'),
   'pnv-xive2-test': files('pnv-xive2-common.c', 'pnv-xive2-flush-sync.c',
                           'pnv-xive2-nvpg_bar.c'),
