@@ -23,6 +23,10 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qemu/crc32c.h"
+#include "qemu/cutils.h"
+#include "qemu/bswap.h"
+#include "crypto/hmac.h"
 #include "system/block-backend.h"
 #include "hw/block/block.h"
 #include "hw/block/flash.h"
@@ -77,6 +81,11 @@ typedef struct FlashPartInfo {
      */
     uint8_t die_cnt;
     uint8_t (*sfdp_read)(uint32_t sfdp_addr);
+    /*
+     * Number of JESD260 Replay Protected Monotonic Counters, 0 if the part
+     * does not support RPMC. Must match the SFDP RPMC parameter table.
+     */
+    uint8_t rpmc_counters;
 } FlashPartInfo;
 
 /* adapted from linux */
@@ -369,6 +378,8 @@ static const FlashPartInfo known_devices[] = {
       .sfdp_read = m25p80_sfdp_w25q01jvq },
     { INFO("w25q02jvm",   0xef7022,      0,  64 << 10, 4096, ER_4K),
       .sfdp_read = m25p80_sfdp_w25q02jvm },
+    { INFO("w25r256jv",   0xef4019,      0,  64 << 10, 512, ER_4K),
+      .sfdp_read = m25p80_sfdp_w25r256jv, .rpmc_counters = 4 },
 
     /* Microchip */
     { INFO("25csm04",      0x29cc00,      0x100,  64 << 10,  8, 0) },
@@ -451,6 +462,10 @@ typedef enum {
     WEVCR = 0x61,
 
     DIE_ERASE = 0xC4,
+
+    /* JESD260 Replay Protected Monotonic Counter */
+    RPMC_OP1 = 0x9B,
+    RPMC_OP2 = 0x96,
 } FlashCMD;
 
 typedef enum {
@@ -461,6 +476,8 @@ typedef enum {
     STATE_COLLECTING_VAR_LEN_DATA,
     STATE_READING_DATA,
     STATE_READING_SFDP,
+    STATE_RPMC_COLLECTING,
+    STATE_RPMC_READING,
 } CMDState;
 
 typedef enum {
@@ -480,6 +497,61 @@ typedef enum {
 } SPIMode;
 
 #define M25P80_INTERNAL_DATA_BUFFER_SZ 16
+
+/* JESD260 Replay Protected Monotonic Counter (RPMC) */
+#define RPMC_MAX_COUNTERS           16
+#define RPMC_HDR_LEN                4   /* opcode, cmd type, counter, rsvd */
+#define RPMC_KEY_LEN                32
+#define RPMC_SIG_LEN                32
+#define RPMC_TRUNC_SIG_LEN          28
+#define RPMC_KEY_DATA_LEN           4
+#define RPMC_COUNTER_LEN            4
+#define RPMC_TAG_LEN                12
+#define RPMC_OP1_MAX_LEN            (RPMC_HDR_LEN + RPMC_KEY_LEN + \
+                                     RPMC_TRUNC_SIG_LEN)
+/* Tag, counter data and signature returned after the status byte by OP2 */
+#define RPMC_RESP_LEN               (RPMC_TAG_LEN + RPMC_COUNTER_LEN + \
+                                     RPMC_SIG_LEN)
+
+/* OP1 command types */
+#define RPMC_CMD_WRITE_ROOT_KEY     0x00
+#define RPMC_CMD_UPDATE_HMAC_KEY    0x01
+#define RPMC_CMD_INCREMENT_COUNTER  0x02
+#define RPMC_CMD_REQUEST_COUNTER    0x03
+
+/* Extended status, returned by OP2 */
+#define RPMC_ES_BUSY                BIT(0)
+/*
+ * Write Root Key: root key overwrite or truncated signature mismatch.
+ * Update HMAC Key: counter not initialized by a root key write.
+ */
+#define RPMC_ES_ROOT_KEY            BIT(1)
+/* Signature mismatch, counter/cmd type out of range or bad payload size */
+#define RPMC_ES_PAYLOAD             BIT(2)
+#define RPMC_ES_HMAC_KEY_UNINIT     BIT(3)
+#define RPMC_ES_COUNTER_MISMATCH    BIT(4)
+#define RPMC_ES_FATAL               BIT(5)
+#define RPMC_ES_SUCCESS             BIT(7)
+
+/* Layout of the optional "rpmc-drive" backing store, all fields big endian */
+#define RPMC_NV_MAGIC               0x52504d43 /* "RPMC" */
+#define RPMC_NV_VERSION             1
+#define RPMC_NV_HDR_LEN             16  /* magic, version, counters, crc32c */
+#define RPMC_NV_COUNTER_LEN         (8 + RPMC_KEY_LEN) /* flags, value, key */
+#define RPMC_NV_FLAG_ROOT_KEY       BIT(0)
+#define RPMC_NV_FLAG_COUNTER        BIT(1)
+#define RPMC_NV_SIZE                4096
+
+typedef struct RPMCCounter {
+    /* Non-volatile */
+    bool root_key_valid;        /* locked by a non all-ones root key */
+    uint8_t root_key[RPMC_KEY_LEN];
+    bool counter_valid;         /* initialized by any root key write */
+    uint32_t value;
+    /* Volatile, lost on power cycle */
+    bool hmac_key_valid;
+    uint8_t hmac_key[RPMC_KEY_LEN];
+} RPMCCounter;
 
 struct Flash {
     SSIPeripheral parent_obj;
@@ -529,6 +601,15 @@ struct Flash {
 
     const FlashPartInfo *pi;
 
+    /* RPMC state, only used when pi->rpmc_counters != 0 */
+    BlockBackend *rpmc_blk;
+    RPMCCounter rpmc[RPMC_MAX_COUNTERS];
+    uint8_t rpmc_status;
+    uint8_t rpmc_in[RPMC_OP1_MAX_LEN];
+    /* May be RPMC_OP1_MAX_LEN + 1 to flag an oversized OP1 packet */
+    uint32_t rpmc_in_len;
+    uint8_t rpmc_resp[RPMC_RESP_LEN];
+    uint32_t rpmc_out_pos;
 };
 
 struct M25P80Class {
@@ -1198,6 +1279,413 @@ static bool is_valid_aai_cmd(uint32_t cmd)
     return cmd == AAI_WP || cmd == WRDI || cmd == RDSR;
 }
 
+/*
+ * JESD260 Replay Protected Monotonic Counter (RPMC)
+ *
+ * OP1 carries a 4 byte header (opcode, command type, counter address,
+ * reserved) followed by a command specific payload, and is executed when
+ * CS# is deasserted. OP2 returns, after one dummy byte, the extended status
+ * followed by the tag, counter data and signature staged by the last
+ * successful Request Monotonic Counter command.
+ *
+ * Every counter has its own root key, HMAC key register and counter. The
+ * root key and counter are non-volatile and can be backed by "rpmc-drive".
+ * The HMAC key register is derived as HMAC-SHA256(root key, key data) and is
+ * lost on power cycle. Commands complete immediately so the device is never
+ * reported busy.
+ */
+
+static bool rpmc_hmac(const uint8_t *key, const uint8_t *data, size_t len,
+                      uint8_t *out)
+{
+    g_autoptr(QCryptoHmac) hmac = NULL;
+    size_t out_len = RPMC_SIG_LEN;
+    Error *err = NULL;
+
+    hmac = qcrypto_hmac_new(QCRYPTO_HASH_ALGO_SHA256, key, RPMC_KEY_LEN, &err);
+    if (!hmac ||
+        qcrypto_hmac_bytes(hmac, (const char *)data, len, &out, &out_len,
+                           &err) < 0) {
+        error_report_err(err);
+        return false;
+    }
+
+    return true;
+}
+
+/* Compare without leaking the position of the first mismatch */
+static bool rpmc_sig_equal(const uint8_t *a, const uint8_t *b, size_t len)
+{
+    uint8_t diff = 0;
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        diff |= a[i] ^ b[i];
+    }
+
+    return diff == 0;
+}
+
+static size_t rpmc_nv_len(Flash *s)
+{
+    return RPMC_NV_HDR_LEN + s->pi->rpmc_counters * RPMC_NV_COUNTER_LEN;
+}
+
+static void rpmc_nv_encode(Flash *s, uint8_t *buf)
+{
+    uint8_t *p = buf + RPMC_NV_HDR_LEN;
+    int i;
+
+    stl_be_p(buf, RPMC_NV_MAGIC);
+    stl_be_p(buf + 4, RPMC_NV_VERSION);
+    stl_be_p(buf + 8, s->pi->rpmc_counters);
+    for (i = 0; i < s->pi->rpmc_counters; i++) {
+        stl_be_p(p, (s->rpmc[i].root_key_valid ? RPMC_NV_FLAG_ROOT_KEY : 0) |
+                    (s->rpmc[i].counter_valid ? RPMC_NV_FLAG_COUNTER : 0));
+        stl_be_p(p + 4, s->rpmc[i].value);
+        memcpy(p + 8, s->rpmc[i].root_key, RPMC_KEY_LEN);
+        p += RPMC_NV_COUNTER_LEN;
+    }
+    stl_be_p(buf + 12, crc32c(0xffffffff, buf + RPMC_NV_HDR_LEN,
+                              rpmc_nv_len(s) - RPMC_NV_HDR_LEN));
+}
+
+static bool rpmc_nv_save(Flash *s)
+{
+    uint8_t buf[RPMC_NV_HDR_LEN + RPMC_MAX_COUNTERS * RPMC_NV_COUNTER_LEN];
+    int ret;
+
+    if (!s->rpmc_blk) {
+        return true;
+    }
+
+    rpmc_nv_encode(s, buf);
+    ret = blk_pwrite(s->rpmc_blk, 0, rpmc_nv_len(s), buf, BDRV_REQ_FUA);
+    if (ret < 0) {
+        error_report("M25P80: failed to update RPMC state: %s",
+                     strerror(-ret));
+        return false;
+    }
+
+    return true;
+}
+
+static bool rpmc_nv_load(Flash *s, Error **errp)
+{
+    uint8_t buf[RPMC_NV_HDR_LEN + RPMC_MAX_COUNTERS * RPMC_NV_COUNTER_LEN];
+    const uint8_t *p = buf + RPMC_NV_HDR_LEN;
+    uint32_t flags;
+    int64_t len;
+    int i, ret;
+
+    len = blk_getlength(s->rpmc_blk);
+    if (len < 0) {
+        error_setg_errno(errp, -len, "can't get size of rpmc-drive");
+        return false;
+    }
+    if (len < RPMC_NV_SIZE) {
+        error_setg(errp, "rpmc-drive must be at least %d bytes", RPMC_NV_SIZE);
+        return false;
+    }
+
+    ret = blk_pread(s->rpmc_blk, 0, rpmc_nv_len(s), buf, 0);
+    if (ret < 0) {
+        error_setg_errno(errp, -ret, "failed to read rpmc-drive");
+        return false;
+    }
+
+    if (ldl_be_p(buf) != RPMC_NV_MAGIC) {
+        /* Blank image: factory state, no root keys and all counters 0 */
+        if (!buffer_is_zero(buf, RPMC_NV_HDR_LEN) &&
+            !(ldl_be_p(buf) == UINT32_MAX && ldl_be_p(buf + 4) == UINT32_MAX)) {
+            error_setg(errp, "rpmc-drive does not contain RPMC state");
+            return false;
+        }
+        if (!rpmc_nv_save(s)) {
+            error_setg(errp, "failed to initialize rpmc-drive");
+            return false;
+        }
+        return true;
+    }
+
+    if (ldl_be_p(buf + 4) != RPMC_NV_VERSION) {
+        error_setg(errp, "rpmc-drive has unsupported version %u",
+                   ldl_be_p(buf + 4));
+        return false;
+    }
+    if (ldl_be_p(buf + 8) != s->pi->rpmc_counters) {
+        error_setg(errp, "rpmc-drive holds %u counters, %s has %u",
+                   ldl_be_p(buf + 8), s->pi->part_name, s->pi->rpmc_counters);
+        return false;
+    }
+    if (ldl_be_p(buf + 12) != crc32c(0xffffffff, buf + RPMC_NV_HDR_LEN,
+                                     rpmc_nv_len(s) - RPMC_NV_HDR_LEN)) {
+        error_setg(errp, "rpmc-drive is corrupted (CRC mismatch)");
+        return false;
+    }
+
+    for (i = 0; i < s->pi->rpmc_counters; i++) {
+        flags = ldl_be_p(p);
+        s->rpmc[i].root_key_valid = flags & RPMC_NV_FLAG_ROOT_KEY;
+        s->rpmc[i].counter_valid = flags & (RPMC_NV_FLAG_ROOT_KEY |
+                                            RPMC_NV_FLAG_COUNTER);
+        s->rpmc[i].value = ldl_be_p(p + 4);
+        memcpy(s->rpmc[i].root_key, p + 8, RPMC_KEY_LEN);
+        p += RPMC_NV_COUNTER_LEN;
+    }
+
+    return true;
+}
+
+static uint8_t rpmc_write_root_key(Flash *s, RPMCCounter *c, const uint8_t *msg)
+{
+    const uint8_t *key = msg + RPMC_HDR_LEN;
+    const uint8_t *trunc_sig = key + RPMC_KEY_LEN;
+    uint8_t sig[RPMC_SIG_LEN];
+    RPMCCounter old = *c;
+    int i;
+
+    if (c->root_key_valid) {
+        return RPMC_ES_ROOT_KEY;
+    }
+
+    /* The truncated signature is the last 224 bits of the HMAC */
+    if (!rpmc_hmac(key, msg, RPMC_HDR_LEN, sig)) {
+        return RPMC_ES_FATAL;
+    }
+    if (!rpmc_sig_equal(sig + RPMC_SIG_LEN - RPMC_TRUNC_SIG_LEN, trunc_sig,
+                        RPMC_TRUNC_SIG_LEN)) {
+        return RPMC_ES_ROOT_KEY;
+    }
+
+    /*
+     * An all-ones root key is a temporary key: it initializes the counter
+     * but leaves the root key register writable. A counter that is already
+     * initialized keeps its value. Any HMAC key derived from the previous
+     * root key is dropped.
+     */
+    memcpy(c->root_key, key, RPMC_KEY_LEN);
+    c->root_key_valid = false;
+    for (i = 0; i < RPMC_KEY_LEN; i++) {
+        c->root_key_valid |= key[i] != 0xff;
+    }
+    if (!c->counter_valid) {
+        c->counter_valid = true;
+        c->value = 0;
+    }
+    c->hmac_key_valid = false;
+    memset(c->hmac_key, 0, RPMC_KEY_LEN);
+    if (!rpmc_nv_save(s)) {
+        *c = old;
+        return RPMC_ES_FATAL;
+    }
+
+    return RPMC_ES_SUCCESS;
+}
+
+static uint8_t rpmc_update_hmac_key(RPMCCounter *c, const uint8_t *msg)
+{
+    const uint8_t *key_data = msg + RPMC_HDR_LEN;
+    const uint8_t *msg_sig = key_data + RPMC_KEY_DATA_LEN;
+    uint8_t hmac_key[RPMC_KEY_LEN];
+    uint8_t sig[RPMC_SIG_LEN];
+
+    if (!c->counter_valid) {
+        return RPMC_ES_ROOT_KEY;
+    }
+
+    if (!rpmc_hmac(c->root_key, key_data, RPMC_KEY_DATA_LEN, hmac_key) ||
+        !rpmc_hmac(hmac_key, msg, RPMC_HDR_LEN + RPMC_KEY_DATA_LEN, sig)) {
+        return RPMC_ES_FATAL;
+    }
+    if (!rpmc_sig_equal(sig, msg_sig, RPMC_SIG_LEN)) {
+        return RPMC_ES_PAYLOAD;
+    }
+
+    memcpy(c->hmac_key, hmac_key, RPMC_KEY_LEN);
+    c->hmac_key_valid = true;
+
+    return RPMC_ES_SUCCESS;
+}
+
+static uint8_t rpmc_increment_counter(Flash *s, RPMCCounter *c,
+                                      const uint8_t *msg)
+{
+    const uint8_t *counter_data = msg + RPMC_HDR_LEN;
+    const uint8_t *msg_sig = counter_data + RPMC_COUNTER_LEN;
+    uint8_t sig[RPMC_SIG_LEN];
+
+    if (!c->hmac_key_valid) {
+        return RPMC_ES_HMAC_KEY_UNINIT;
+    }
+
+    /* Authenticate before revealing whether the counter data matches */
+    if (!rpmc_hmac(c->hmac_key, msg, RPMC_HDR_LEN + RPMC_COUNTER_LEN, sig)) {
+        return RPMC_ES_FATAL;
+    }
+    if (!rpmc_sig_equal(sig, msg_sig, RPMC_SIG_LEN)) {
+        return RPMC_ES_PAYLOAD;
+    }
+    if (ldl_be_p(counter_data) != c->value) {
+        return RPMC_ES_COUNTER_MISMATCH;
+    }
+    /* JESD260 does not define wrap around, an exhausted counter is fatal */
+    if (c->value == UINT32_MAX) {
+        return RPMC_ES_FATAL;
+    }
+
+    c->value++;
+    if (!rpmc_nv_save(s)) {
+        c->value--;
+        return RPMC_ES_FATAL;
+    }
+
+    return RPMC_ES_SUCCESS;
+}
+
+static uint8_t rpmc_request_counter(Flash *s, RPMCCounter *c,
+                                    const uint8_t *msg)
+{
+    const uint8_t *tag = msg + RPMC_HDR_LEN;
+    const uint8_t *msg_sig = tag + RPMC_TAG_LEN;
+    uint8_t *resp_counter = s->rpmc_resp + RPMC_TAG_LEN;
+    uint8_t *resp_sig = resp_counter + RPMC_COUNTER_LEN;
+    uint8_t sig[RPMC_SIG_LEN];
+
+    if (!c->hmac_key_valid) {
+        return RPMC_ES_HMAC_KEY_UNINIT;
+    }
+
+    if (!rpmc_hmac(c->hmac_key, msg, RPMC_HDR_LEN + RPMC_TAG_LEN, sig)) {
+        return RPMC_ES_FATAL;
+    }
+    if (!rpmc_sig_equal(sig, msg_sig, RPMC_SIG_LEN)) {
+        return RPMC_ES_PAYLOAD;
+    }
+
+    memcpy(s->rpmc_resp, tag, RPMC_TAG_LEN);
+    stl_be_p(resp_counter, c->value);
+    if (!rpmc_hmac(c->hmac_key, s->rpmc_resp, RPMC_TAG_LEN + RPMC_COUNTER_LEN,
+                   resp_sig)) {
+        memset(s->rpmc_resp, 0, RPMC_RESP_LEN);
+        return RPMC_ES_FATAL;
+    }
+
+    return RPMC_ES_SUCCESS;
+}
+
+/* Called when CS# is deasserted at the end of an OP1 packet */
+static void rpmc_op1_complete(Flash *s)
+{
+    const uint8_t *msg = s->rpmc_in;
+    uint32_t expected_len;
+    uint8_t cmd_type = msg[1];
+    uint8_t counter = msg[2];
+    uint8_t status;
+
+    /* A new OP1 always invalidates the previously staged response */
+    memset(s->rpmc_resp, 0, RPMC_RESP_LEN);
+
+    switch (cmd_type) {
+    case RPMC_CMD_WRITE_ROOT_KEY:
+        expected_len = RPMC_HDR_LEN + RPMC_KEY_LEN + RPMC_TRUNC_SIG_LEN;
+        break;
+    case RPMC_CMD_UPDATE_HMAC_KEY:
+        expected_len = RPMC_HDR_LEN + RPMC_KEY_DATA_LEN + RPMC_SIG_LEN;
+        break;
+    case RPMC_CMD_INCREMENT_COUNTER:
+        expected_len = RPMC_HDR_LEN + RPMC_COUNTER_LEN + RPMC_SIG_LEN;
+        break;
+    case RPMC_CMD_REQUEST_COUNTER:
+        expected_len = RPMC_HDR_LEN + RPMC_TAG_LEN + RPMC_SIG_LEN;
+        break;
+    default:
+        expected_len = 0;
+        break;
+    }
+
+    if (s->rpmc_in_len < RPMC_HDR_LEN || !expected_len ||
+        s->rpmc_in_len != expected_len ||
+        counter >= s->pi->rpmc_counters) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "M25P80: Invalid RPMC OP1 packet: cmd type 0x%x, "
+                      "counter %u, length %u\n",
+                      cmd_type, counter, s->rpmc_in_len);
+        status = RPMC_ES_PAYLOAD;
+        goto out;
+    }
+
+    switch (cmd_type) {
+    case RPMC_CMD_WRITE_ROOT_KEY:
+        status = rpmc_write_root_key(s, &s->rpmc[counter], msg);
+        break;
+    case RPMC_CMD_UPDATE_HMAC_KEY:
+        status = rpmc_update_hmac_key(&s->rpmc[counter], msg);
+        break;
+    case RPMC_CMD_INCREMENT_COUNTER:
+        status = rpmc_increment_counter(s, &s->rpmc[counter], msg);
+        break;
+    case RPMC_CMD_REQUEST_COUNTER:
+        status = rpmc_request_counter(s, &s->rpmc[counter], msg);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+out:
+    s->rpmc_status = status;
+    trace_m25p80_rpmc_op1(s, cmd_type, counter, s->rpmc_in_len, status);
+}
+
+static uint8_t rpmc_op2_read(Flash *s)
+{
+    uint32_t pos = s->rpmc_out_pos;
+    uint8_t r;
+
+    if (pos == 0) {
+        r = 0; /* dummy byte */
+    } else if (pos == 1) {
+        r = s->rpmc_status;
+    } else if (pos < 2 + RPMC_RESP_LEN) {
+        r = s->rpmc_resp[pos - 2];
+    } else {
+        r = 0xff;
+    }
+
+    if (pos < 2 + RPMC_RESP_LEN) {
+        s->rpmc_out_pos++;
+    }
+    trace_m25p80_rpmc_op2(s, pos, r);
+
+    return r;
+}
+
+static void decode_rpmc_cmd(Flash *s, uint8_t value)
+{
+    if (value == RPMC_OP1) {
+        s->rpmc_in[0] = value;
+        s->rpmc_in_len = 1;
+        s->state = STATE_RPMC_COLLECTING;
+    } else {
+        s->rpmc_out_pos = 0;
+        s->state = STATE_RPMC_READING;
+    }
+}
+
+static void rpmc_reset(Flash *s)
+{
+    int i;
+
+    for (i = 0; i < RPMC_MAX_COUNTERS; i++) {
+        s->rpmc[i].hmac_key_valid = false;
+        memset(s->rpmc[i].hmac_key, 0, RPMC_KEY_LEN);
+    }
+    s->rpmc_status = 0;
+    s->rpmc_in_len = 0;
+    s->rpmc_out_pos = 0;
+    memset(s->rpmc_resp, 0, RPMC_RESP_LEN);
+}
+
 static void decode_new_cmd(Flash *s, uint32_t value)
 {
     int i;
@@ -1212,6 +1700,11 @@ static void decode_new_cmd(Flash *s, uint32_t value)
     if (get_man(s) == MAN_SST && s->aai_enable && !is_valid_aai_cmd(value)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "M25P80: Invalid cmd within AAI programming sequence");
+    }
+
+    if (s->pi->rpmc_counters && (value == RPMC_OP1 || value == RPMC_OP2)) {
+        decode_rpmc_cmd(s, value);
+        return;
     }
 
     switch (value) {
@@ -1600,6 +2093,8 @@ static int m25p80_cs(SSIPeripheral *ss, bool select)
     if (select) {
         if (s->state == STATE_COLLECTING_VAR_LEN_DATA) {
             complete_collecting_data(s);
+        } else if (s->state == STATE_RPMC_COLLECTING) {
+            rpmc_op1_complete(s);
         }
         s->len = 0;
         s->pos = 0;
@@ -1696,6 +2191,19 @@ static uint32_t m25p80_transfer8(SSIPeripheral *ss, uint32_t tx)
         s->cur_addr = (s->cur_addr + 1) & (M25P80_SFDP_MAX_SIZE - 1);
         break;
 
+    case STATE_RPMC_COLLECTING:
+        /* Oversized packets are rejected when CS# is deasserted */
+        if (s->rpmc_in_len < RPMC_OP1_MAX_LEN) {
+            s->rpmc_in[s->rpmc_in_len++] = (uint8_t)tx;
+        } else {
+            s->rpmc_in_len = RPMC_OP1_MAX_LEN + 1;
+        }
+        break;
+
+    case STATE_RPMC_READING:
+        r = rpmc_op2_read(s);
+        break;
+
     default:
     case STATE_IDLE:
         decode_new_cmd(s, (uint8_t)tx);
@@ -1745,6 +2253,34 @@ static void m25p80_realize(SSIPeripheral *ss, Error **errp)
         memset(s->storage, 0xFF, s->size);
     }
 
+    if (s->rpmc_blk) {
+        if (!s->pi->rpmc_counters) {
+            error_setg(errp, "%s does not support RPMC, rpmc-drive is invalid",
+                       s->pi->part_name);
+            return;
+        }
+        if (!blk_supports_write_perm(s->rpmc_blk)) {
+            error_setg(errp, "rpmc-drive must be writable");
+            return;
+        }
+        ret = blk_set_perm(s->rpmc_blk,
+                           BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
+                           BLK_PERM_ALL, errp);
+        if (ret < 0) {
+            return;
+        }
+    }
+    if (s->pi->rpmc_counters) {
+        assert(s->pi->rpmc_counters <= RPMC_MAX_COUNTERS);
+        if (!qcrypto_hmac_supports(QCRYPTO_HASH_ALGO_SHA256)) {
+            error_setg(errp, "RPMC requires HMAC-SHA256 support");
+            return;
+        }
+        if (s->rpmc_blk && !rpmc_nv_load(s, errp)) {
+            return;
+        }
+    }
+
     qdev_init_gpio_in_named(DEVICE(s),
                             m25p80_write_protect_pin_irq_handler, "WP#", 1);
 }
@@ -1762,6 +2298,7 @@ static void m25p80_reset(DeviceState *d)
     s->top_bottom_bit = false;
 
     reset_memory(s);
+    rpmc_reset(s);
 }
 
 static int m25p80_pre_save(void *opaque)
@@ -1780,6 +2317,7 @@ static const Property m25p80_properties[] = {
     DEFINE_PROP_UINT8("spansion-cr3nv", Flash, spansion_cr3nv, 0x2),
     DEFINE_PROP_UINT8("spansion-cr4nv", Flash, spansion_cr4nv, 0x10),
     DEFINE_PROP_DRIVE("drive", Flash, blk),
+    DEFINE_PROP_DRIVE("rpmc-drive", Flash, rpmc_blk),
 };
 
 static int m25p80_pre_load(void *opaque)
@@ -1871,6 +2409,45 @@ static const VMStateDescription vmstate_m25p80_block_protect = {
     }
 };
 
+static bool m25p80_rpmc_needed(void *opaque)
+{
+    Flash *s = (Flash *)opaque;
+
+    return s->pi->rpmc_counters;
+}
+
+static const VMStateDescription vmstate_m25p80_rpmc_counter = {
+    .name = "m25p80/rpmc/counter",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(root_key_valid, RPMCCounter),
+        VMSTATE_UINT8_ARRAY(root_key, RPMCCounter, RPMC_KEY_LEN),
+        VMSTATE_BOOL(counter_valid, RPMCCounter),
+        VMSTATE_UINT32(value, RPMCCounter),
+        VMSTATE_BOOL(hmac_key_valid, RPMCCounter),
+        VMSTATE_UINT8_ARRAY(hmac_key, RPMCCounter, RPMC_KEY_LEN),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_m25p80_rpmc = {
+    .name = "m25p80/rpmc",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = m25p80_rpmc_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_STRUCT_ARRAY(rpmc, Flash, RPMC_MAX_COUNTERS, 1,
+                             vmstate_m25p80_rpmc_counter, RPMCCounter),
+        VMSTATE_UINT8(rpmc_status, Flash),
+        VMSTATE_UINT8_ARRAY(rpmc_in, Flash, RPMC_OP1_MAX_LEN),
+        VMSTATE_UINT32(rpmc_in_len, Flash),
+        VMSTATE_UINT8_ARRAY(rpmc_resp, Flash, RPMC_RESP_LEN),
+        VMSTATE_UINT32(rpmc_out_pos, Flash),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_m25p80 = {
     .name = "m25p80",
     .version_id = 0,
@@ -1904,6 +2481,7 @@ static const VMStateDescription vmstate_m25p80 = {
         &vmstate_m25p80_aai_enable,
         &vmstate_m25p80_write_protect,
         &vmstate_m25p80_block_protect,
+        &vmstate_m25p80_rpmc,
         NULL
     }
 };

@@ -103,6 +103,8 @@ m25p80_read_data(void *s, uint32_t pos, uint8_t v) "[%p] Read data 0x%"PRIx32"=0
 m25p80_read_sfdp(void *s, uint32_t addr, uint8_t v) "[%p] Read SFDP 0x%"PRIx32"=0x%"PRIx8
 m25p80_binding(void *s) "[%p] Binding to IF_MTD drive"
 m25p80_binding_no_bdrv(void *s) "[%p] No BDRV - binding to RAM"
+m25p80_rpmc_op1(void *s, uint8_t cmd_type, uint8_t counter, uint32_t len, uint8_t status) "[%p] RPMC OP1 cmd type 0x%"PRIx8" counter %u len %u status 0x%"PRIx8
+m25p80_rpmc_op2(void *s, uint32_t pos, uint8_t v) "[%p] RPMC OP2 byte %u = 0x%"PRIx8
 
 # swim.c
 swim_ismctrl_read(int reg, const char *name, unsigned size, uint64_t value) "reg=%d [%s] size=%u value=0x%"PRIx64
